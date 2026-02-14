@@ -1,0 +1,409 @@
+# =========================================================
+# JD–Resume Matcher (Colab) — OpenAI text-embedding-3-small with local fallback
+# =========================================================
+# Run the entire cell in Google Colab. Upload JDs and Resumes when prompted.
+# Requires: pip install -q pdfplumber pdf2image pytesseract openai numpy pandas scikit-learn sentence-transformers
+# =========================================================
+
+# --------------------
+# INSTALL (Colab)
+# --------------------
+!apt-get update -qq
+!apt-get install -y poppler-utils tesseract-ocr -qq
+!pip install -q pdfplumber pdf2image pytesseract openai numpy pandas scikit-learn sentence-transformers
+
+# --------------------
+# IMPORTS
+# --------------------
+import os, re, json, uuid, shutil
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import pdfplumber
+from pdf2image import convert_from_path
+import pytesseract
+from sklearn.metrics.pairwise import cosine_similarity
+from google.colab import files
+
+# Try to import OpenAI (may be missing if user uninstalled)
+use_openai_possible = True
+try:
+    from openai import OpenAI
+except Exception:
+    use_openai_possible = False
+
+# --------------------
+# USER CONFIG
+# --------------------
+# Put your OpenAI key in Colab environment or paste here (do NOT hardcode in committed code)
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or "YOUR_OPENAI_KEY_HERE"
+
+# Storage path (you confirmed /content/data/)
+BASE = Path("/content/data")
+JD_VECTORS = BASE / "jd_vectors"         # per-jd folder + sections (npy) + meta.json
+RESUME_VECTORS = BASE / "resume_vectors" # per-resume folder + sections (npy) + meta.json
+JDS = BASE / "JDs"                       # uploaded JD PDFs
+RESUMES = BASE / "Resumes"               # uploaded Resume PDFs
+OUTPUT = BASE / "output"
+TOP_N = 10                               # N = 10 (you picked)
+
+for p in [BASE, JD_VECTORS, RESUME_VECTORS, JDS, RESUMES, OUTPUT]:
+    p.mkdir(parents=True, exist_ok=True)
+
+# --------------------
+# INITIALIZE embedding backend: OpenAI if key valid else SentenceTransformer local
+# --------------------
+USE_OPENAI = False
+OPENAI_CLIENT = None
+LOCAL_MODEL = None
+EMB_DIM = None
+
+if use_openai_possible and OPENAI_API_KEY and "YOUR_OPENAI_KEY_HERE" not in OPENAI_API_KEY:
+    try:
+        OPENAI_CLIENT = OpenAI(api_key=OPENAI_API_KEY)
+        # quick test call (no cost heavy) - omitted; rely on exception at first embedding call
+        USE_OPENAI = True
+        EMB_DIM = 1536
+        print("✅ Using OpenAI embeddings (text-embedding-3-small).")
+    except Exception as e:
+        print("⚠️ OpenAI init failed, falling back to local model. Error:", e)
+        USE_OPENAI = False
+
+if not USE_OPENAI:
+    # Use local SentenceTransformer
+    from sentence_transformers import SentenceTransformer
+    LOCAL_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
+    EMB_DIM = LOCAL_MODEL.get_sentence_embedding_dimension()
+    print("⚙️ Using local SentenceTransformer: all-MiniLM-L6-v2 (offline). Embedding dim:", EMB_DIM)
+
+# --------------------
+# SECTION MAPPING + WEIGHTS
+# --------------------
+SECTION_MAP = {
+    "Required Skills": ["Skills", "Projects"],
+    "Good to Have": ["Skills", "Experience"],
+    "Responsibilities": ["Projects", "Experience"]
+}
+
+SECTION_WEIGHTS = {
+    "Required Skills": 0.45,
+    "Good to Have": 0.25,
+    "Responsibilities": 0.30
+}
+
+# --------------------
+# UTILITIES: text extraction, cleaning, parsing
+# --------------------
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r'Page\s*\d+\s*(of\s*\d+)?', ' ', text, flags=re.I)
+    text = re.sub(r'http\S+', ' ', text)
+    text = re.sub(r'[\r\t]', ' ', text)
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'[^\x00-\x7F]+',' ', text)
+    return text.strip()
+
+def extract_text_from_pdf(path: str) -> str:
+    text = ""
+    try:
+        with pdfplumber.open(path) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text += t + "\n"
+    except Exception as e:
+        # OCR fallback
+        try:
+            pages = convert_from_path(path)
+            for page in pages:
+                text += pytesseract.image_to_string(page) + "\n"
+        except Exception as e2:
+            print("PDF extraction error:", e, "| OCR fallback error:", e2)
+    return clean_text(text)
+
+def extract_section(text: str, start_pattern: str, end_pattern: str) -> str:
+    try:
+        m = re.search(rf"({start_pattern})(.+?)(?={end_pattern})", text, re.S | re.I)
+        return m.group(2).strip() if m else ""
+    except Exception:
+        return ""
+
+def parse_jd(text: str):
+    return {
+        "Required Skills": extract_section(text, r"Requirements|Required Skills|Technical Skills", r"Good to have|Preferred|Responsibilities|$"),
+        "Good to Have": extract_section(text, r"Good to have|Preferred", r"Responsibilities|$"),
+        "Responsibilities": extract_section(text, r"Responsibilities|Key Responsibilities", r"Requirements|Skills|$"),
+    }
+
+def parse_resume(text: str):
+    return {
+        "Skills": extract_section(text, r"Skills|Technical Skills|Technologies", r"Experience|Projects|Education|$"),
+        "Experience": extract_section(text, r"Experience|Work History", r"Projects|Education|$"),
+        "Projects": extract_section(text, r"Projects|Academic Projects", r"Experience|Education|$"),
+    }
+
+# --------------------
+# EMBEDDING wrapper (OpenAI or local)
+# --------------------
+def embed_text_list(texts):
+    """Return numpy array (N x EMB_DIM) for a list of texts."""
+    if not texts:
+        return np.zeros((0, EMB_DIM), dtype=np.float32)
+    if USE_OPENAI:
+        # chunking handled externally; OpenAI supports batch, but use per-call to catch errors
+        out = []
+        for t in texts:
+            if not t or not t.strip():
+                out.append(np.zeros(EMB_DIM, dtype=np.float32))
+                continue
+            try:
+                resp = OPENAI_CLIENT.embeddings.create(model="text-embedding-3-small", input=t[:6000])
+                vec = np.array(resp.data[0].embedding, dtype=np.float32)
+                out.append(vec)
+            except Exception as e:
+                print("Embedding error:", e)
+                out.append(np.zeros(EMB_DIM, dtype=np.float32))
+        return np.vstack(out).astype(np.float32)
+    else:
+        emb = LOCAL_MODEL.encode(texts, batch_size=32, convert_to_numpy=True, show_progress_bar=False)
+        return emb.astype(np.float32)
+
+def embed_text_single(text):
+    return embed_text_list([text])[0]
+
+# --------------------
+# CACHE: save/load per-file section-wise embeddings (no re-embed)
+# --------------------
+def save_section_embeddings(folder: Path, file_id: str, sections: dict, meta: dict):
+    dest = folder / file_id
+    dest.mkdir(parents=True, exist_ok=True)
+    # compute embeddings in batch for sections that don't exist
+    pending = []
+    pending_keys = []
+    for sec, txt in sections.items():
+        sec_fname = dest / f"{sec.replace(' ','_')}.npy"
+        if sec_fname.exists():
+            continue
+        pending.append(txt or "")
+        pending_keys.append(sec)
+    if pending:
+        embs = embed_text_list(pending)
+        for k, emb in zip(pending_keys, embs):
+            np.save(dest / f"{k.replace(' ','_')}.npy", emb)
+    # Ensure zero-vector saved for missing sections if not present
+    for sec in sections.keys():
+        sec_fname = dest / f"{sec.replace(' ','_')}.npy"
+        if not sec_fname.exists():
+            np.save(sec_fname, np.zeros(EMB_DIM, dtype=np.float32))
+    # save meta
+    (dest / "meta.json").write_text(json.dumps(meta, indent=2))
+
+def load_all_section_embeddings(folder: Path):
+    entries = []
+    if not folder.exists():
+        return entries
+    for file_dir in sorted(folder.iterdir()):
+        if not file_dir.is_dir():
+            continue
+        meta_path = file_dir / "meta.json"
+        meta = json.loads(meta_path.read_text()) if meta_path.exists() else {}
+        sec_vectors = {}
+        for npy in file_dir.glob("*.npy"):
+            sec_name = npy.stem  # section filename without .npy
+            vec = np.load(npy)
+            sec_vectors[sec_name.replace("_"," ")] = vec
+        entries.append((file_dir.name, sec_vectors, meta))
+    return entries
+
+# --------------------
+# SCORING helpers
+# --------------------
+def safe_cosine(v1: np.ndarray, v2: np.ndarray) -> float:
+    if v1 is None or v2 is None:
+        return 0.0
+    if np.linalg.norm(v1)==0 or np.linalg.norm(v2)==0:
+        return 0.0
+    return float(cosine_similarity(v1.reshape(1,-1), v2.reshape(1,-1))[0][0])
+
+def detailed_score_for_pair(jd_sec_vecs: dict, resume_sec_vecs: dict):
+    section_scores = {}
+    for jd_sec, mapped_res in SECTION_MAP.items():
+        jvec = jd_sec_vecs.get(jd_sec)
+        if jvec is None or np.linalg.norm(jvec)==0:
+            section_scores[jd_sec] = 0.0
+            continue
+        subs = []
+        for rsec in mapped_res:
+            rvec = resume_sec_vecs.get(rsec)
+            if rvec is not None:
+                s = safe_cosine(jvec, rvec)
+                subs.append(s)
+        section_scores[jd_sec] = float(np.mean(subs)) if subs else 0.0
+    total_weight = 0.0
+    weighted_sum = 0.0
+    for sec, score in section_scores.items():
+        w = SECTION_WEIGHTS.get(sec, 1.0)
+        weighted_sum += w * score
+        total_weight += w
+    overall = float(weighted_sum / total_weight) if total_weight>0 else 0.0
+    return section_scores, overall
+
+# --------------------
+# PROCESS NEW JD & RESUME (incremental)
+# --------------------
+def process_new_jd(pdf_path: str, top_n: int = TOP_N):
+    fname = Path(pdf_path).name
+    file_id = fname
+    print(f"\nProcessing JD: {fname}")
+    text = extract_text_from_pdf(pdf_path)
+    sections = parse_jd(text)
+    save_section_embeddings(JD_VECTORS, file_id, sections, {"filename": fname, "sections": list(sections.keys())})
+
+    resumes = load_all_section_embeddings(RESUME_VECTORS)
+    if not resumes:
+        print("No resumes stored yet — stored JD only.")
+        return []
+
+    jd_sec_vecs = {}
+    jd_folder = JD_VECTORS / file_id
+    for sec in sections.keys():
+        p = jd_folder / f"{sec.replace(' ','_')}.npy"
+        if p.exists():
+            jd_sec_vecs[sec] = np.load(p)
+
+    results = []
+    for rid, rsecs, rmeta in resumes:
+        sec_scores, overall = detailed_score_for_pair(jd_sec_vecs, rsecs)
+        results.append({
+            "JD_File": fname,
+            "Resume_File": rmeta.get("filename", rid),
+            "JD_ID": file_id,
+            "Resume_ID": rid,
+            "section_scores": sec_scores,
+            "overall_score": overall
+        })
+    results = sorted(results, key=lambda x: x["overall_score"], reverse=True)[:top_n]
+
+    out_rows = []
+    for r in results:
+        row = {
+            "JD_File": r["JD_File"],
+            "Resume_File": r["Resume_File"],
+            "overall_score": round(r["overall_score"], 4)
+        }
+        for sec, val in r["section_scores"].items():
+            row[f"{sec} ↔ ({' + '.join(SECTION_MAP[sec])})"] = round(val,4)
+        out_rows.append(row)
+    if out_rows:
+        df = pd.DataFrame(out_rows)
+        out_name = OUTPUT / f"jd_matches__{file_id}.csv"
+        df.to_csv(out_name, index=False)
+        print(f"Saved top matches → {out_name}")
+
+    # Print in requested human-friendly format
+    print(f"\nJD: {fname}\n" + "-"*34)
+    for r in results:
+        print(f"vs Resume ({r['Resume_File']}) → Overall Score: {round(r['overall_score'],4)}")
+    print("-"*34)
+    return results
+
+def process_new_resume(pdf_path: str, top_n: int = TOP_N):
+    fname = Path(pdf_path).name
+    file_id = fname
+    print(f"\nProcessing Resume: {fname}")
+    text = extract_text_from_pdf(pdf_path)
+    sections = parse_resume(text)
+    save_section_embeddings(RESUME_VECTORS, file_id, sections, {"filename": fname, "sections": list(sections.keys())})
+
+    jds = load_all_section_embeddings(JD_VECTORS)
+    if not jds:
+        print("No JDs stored yet — stored resume only.")
+        return []
+
+    resume_sec_vecs = {}
+    resume_folder = RESUME_VECTORS / file_id
+    for sec in sections.keys():
+        p = resume_folder / f"{sec.replace(' ','_')}.npy"
+        if p.exists():
+            resume_sec_vecs[sec] = np.load(p)
+
+    results = []
+    for jid, jdsecs, jdmeta in jds:
+        sec_scores, overall = detailed_score_for_pair(jdsecs, resume_sec_vecs)
+        results.append({
+            "Resume_File": fname,
+            "JD_File": jdmeta.get("filename", jid),
+            "Resume_ID": file_id,
+            "JD_ID": jid,
+            "section_scores": sec_scores,
+            "overall_score": overall
+        })
+    results = sorted(results, key=lambda x: x["overall_score"], reverse=True)[:top_n]
+
+    out_rows = []
+    for r in results:
+        row = {
+            "Resume_File": r["Resume_File"],
+            "JD_File": r["JD_File"],
+            "overall_score": round(r["overall_score"], 4)
+        }
+        for sec, val in r["section_scores"].items():
+            row[f"{sec} ↔ ({' + '.join(SECTION_MAP[sec])})"] = round(val, 4)
+        out_rows.append(row)
+    if out_rows:
+        df = pd.DataFrame(out_rows)
+        out_name = OUTPUT / f"resume_matches__{file_id}.csv"
+        df.to_csv(out_name, index=False)
+        print(f"Saved top matches → {out_name}")
+
+    print(f"\nResume: {fname}\n" + "-"*34)
+    for r in results:
+        print(f"vs JD ({r['JD_File']}) → Overall Score: {round(r['overall_score'],4)}")
+    print("-"*34)
+    return results
+
+# --------------------
+# BATCH order: embed all newly uploaded resumes first (so JDs compare to them in same run), then embed JDs and compare
+# --------------------
+def process_uploaded_jds_and_resumes(new_jd_files:list, new_resume_files:list):
+    # First ensure resume embeddings are created (so JD comparisons can include these)
+    for res in new_resume_files:
+        # save & embed (caching prevents re-embedding existing)
+        text = extract_text_from_pdf(str(res))
+        sections = parse_resume(text)
+        save_section_embeddings(RESUME_VECTORS, res.name, sections, {"filename": res.name, "sections": list(sections.keys())})
+    # Now process JDs (each JD will compare vs all resumes including those just saved)
+    for jd in new_jd_files:
+        process_new_jd(str(jd), TOP_N)
+    # Finally process resumes (compare each resume vs all stored JDs)
+    for res in new_resume_files:
+        process_new_resume(str(res), TOP_N)
+
+# --------------------
+# INTERACTIVE UPLOAD (Colab)
+# --------------------
+print("📄 Upload JD PDF files (choose 1 or many) — Colab will show the upload dialog.")
+uploaded = files.upload()  # choose JDs
+new_jds = []
+for name, content in uploaded.items():
+    dest = JDS / name
+    open(dest, "wb").write(content)
+    new_jds.append(dest)
+print(f"Saved {len(new_jds)} JDs to {JDS}")
+
+print("\n📄 Upload Resume PDF files (choose 1 or many).")
+uploaded = files.upload()  # choose Resumes
+new_resumes = []
+for name, content in uploaded.items():
+    dest = RESUMES / name
+    open(dest, "wb").write(content)
+    new_resumes.append(dest)
+print(f"Saved {len(new_resumes)} Resumes to {RESUMES}")
+
+# --------------------
+# RUN incremental matching for newly uploaded files
+# --------------------
+print("\n⏳ Running incremental matching (new files only)...")
+process_uploaded_jds_and_resumes(new_jds, new_resumes)
+print("\n✅ Done. Check CSVs in", OUTPUT)
